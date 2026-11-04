@@ -11,6 +11,7 @@ worker's computation is shared with every other worker. These tests verify:
   failing the endpoint.
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -156,5 +157,48 @@ class TestDistributedBankStatsCache:
         try:
             stats = await memory.get_bank_stats(bank_id, request_context=request_context)
             assert stats["node_counts"].get("experience") == 1
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
+    async def test_stats_read_racing_a_delete_does_not_leak_into_the_recreated_bank(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """A stats read that started before a bank delete must not cache the old bank's numbers.
+
+        With many API pods, one pod computes stats (slow on a busy bank) while another deletes the
+        bank and the caller recreates it. If the late result is written back, the new bank shows the
+        deleted bank's counts and timestamps until the cache expires.
+        """
+        if memory._database_backend_type != "postgresql":
+            pytest.skip("distributed cache is PostgreSQL-only")
+
+        bank_id = f"test-dist-stats-recreate-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            await _insert_memory(conn, bank_id, "Alice loves hiking.")
+
+        cache = _pin_distributed_cache(memory)
+        computed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_old_stats():
+            old = await memory._compute_bank_stats(bank_id)
+            computed.set()
+            await release.wait()
+            return old
+
+        try:
+            late = asyncio.create_task(cache.get_or_load(get_current_schema(), bank_id, slow_old_stats))
+            await computed.wait()
+            await memory.delete_bank(bank_id, request_context=request_context)
+            await _ensure_bank(memory, bank_id, request_context)
+            release.set()
+            assert (await late)["node_counts"]["experience"] == 1  # the caller still gets its answer
+
+            stats = await memory.get_bank_stats(bank_id, request_context=request_context)
+            assert stats["node_counts"].get("experience", 0) == 0
         finally:
             await memory.delete_bank(bank_id, request_context=request_context)

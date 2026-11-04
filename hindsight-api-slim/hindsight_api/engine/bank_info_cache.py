@@ -12,8 +12,10 @@ not one. Removing both is what lets such a retain
 run without touching the database at all.
 
 **This is a real consistency trade, not a free win.** A bank edited in ANOTHER process is not
-visible to a reader holding a cached entry until that entry expires, so across pods the guarantee
-is "eventually consistent within the TTL".
+visible to a reader holding a cached entry until this process reads the bank change log
+(``bank_cache_sync``, about once a second) or, when that sync is off or failing, until the entry
+expires. Across pods the guarantee is "eventually consistent", within the sync interval normally and
+the TTL at worst.
 
 Within the writing process it is not a trade, because :func:`invalidate` is called on every path
 that writes the bank row. That is not an optimisation for one pod -- it is what keeps the API's
@@ -98,13 +100,26 @@ async def get_or_load(bank_id: str, kind: str, loader: Callable[[], Awaitable[di
 
 
 async def invalidate(bank_id: str, kind: str | None = None) -> None:
-    """Drop this bank's cached rows. `kind` narrows it to "profile" or "config"; None drops both.
+    """Drop this bank's cached rows, here and (within ``bank_cache_sync_interval_seconds``) in
+    every other process. `kind` narrows the local drop to "profile" or "config"; None drops both.
 
     Called by every path that writes the bank row. The two kinds are dropped together by default
     because a caller that has just written one rarely knows which reads the request will make next,
     and dropping the other costs a single re-read.
     """
+    from . import bank_cache_sync
+
+    await forget(_schema(), bank_id, kind)
+    await bank_cache_sync.publish(_schema(), bank_id)
+
+
+async def forget(schema: str, bank_id: str, kind: str | None = None) -> None:
+    """Drop this bank's cached rows in this process only."""
     cache = _get_cache()
     for k in (kind,) if kind else ("profile", "config"):
-        schema, key = _key(bank_id, k)
-        await cache.invalidate(schema, key)
+        await cache.invalidate(schema, f"{k}:{bank_id}")
+
+
+async def forget_all() -> None:
+    """Drop every cached row in this process."""
+    await _get_cache().clear()

@@ -2686,12 +2686,20 @@ This ensures `shadow-*` banks are always consolidated before others, even if the
 
 #### Bank alias cache
 
-A bank alias is an extra id a bank answers to, so callers can be moved onto a new id without downtime. Resolving it happens on every bank-scoped request and is cached per `(schema, alias)` — misses included, since most requests name a real bank. The TTL is therefore how long a newly added alias stays invisible, and a removed one keeps routing, on API replicas other than the one that changed it.
+A bank alias is an extra id a bank answers to, so callers can be moved onto a new id without downtime. Resolving it happens on every bank-scoped request and is cached per `(schema, alias)` — misses included, since most requests name a real bank. The TTL bounds how long a newly added alias stays invisible, and a removed one keeps routing, on API replicas other than the one that changed it; with the [bank cache sync](#bank-cache-sync-across-replicas) on, they catch up within about a second.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_BANK_ALIAS_CACHE_TTL_SECONDS` | Time-to-live (seconds) for a resolved alias. `0` disables the cache and resolves against the database on every request. | `10` |
 | `HINDSIGHT_API_BANK_ALIAS_CACHE_MAX_ENTRIES` | Maximum number of cached `(schema, alias)` entries before LRU eviction. | `2048` |
+
+#### Bank cache sync across replicas
+
+Each API replica and worker caches a bank's profile, config and alias routing in memory. When one process changes or deletes a bank (or an alias), it appends a row to a small change log in the base schema; every process reads that log about once a second and drops the banks it names from its own caches. So after a bank is deleted and recreated under the same id, or its config changes, other replicas pick up the new bank within about a second instead of waiting out the cache TTLs. It uses plain queries only, so it works behind PgBouncer in transaction mode. PostgreSQL only: on Oracle the TTLs remain the only bound.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_BANK_CACHE_SYNC_INTERVAL_SECONDS` | How often (seconds) each process reads the bank change log. `0` disables it, and the cache TTLs alone bound how long other processes serve a changed or deleted bank. | `1` |
 
 #### Bank stats cache
 

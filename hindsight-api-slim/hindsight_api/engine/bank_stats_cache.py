@@ -210,6 +210,10 @@ class DistributedBankStatsCache:
     def _qualified(schema: str) -> str:
         return f'"{schema}".bank_stats_cache' if schema else "bank_stats_cache"
 
+    @staticmethod
+    def _banks(schema: str) -> str:
+        return f'"{schema}".banks' if schema else "banks"
+
     async def get_or_load(
         self,
         schema: str,
@@ -224,32 +228,38 @@ class DistributedBankStatsCache:
         table = self._qualified(schema)
 
         # 1. Fresh row? Single PK lookup; ``payload::text`` sidesteps any
-        #    jsonb->object codec so we always decode the same way. Skipped when
-        #    the caller forces a refresh — then we recompute and overwrite below.
-        if not force_refresh:
-            try:
-                async with acquire_with_retry(self._backend) as conn:
-                    row = await conn.fetchrow(
-                        f"SELECT payload::text AS payload FROM {table} "
-                        f"WHERE bank_id = $1 AND computed_at > now() - make_interval(secs => $2::double precision)",
-                        bank_id,
-                        self._ttl,
-                    )
-                if row is not None:
-                    return json.loads(row["payload"])
-            except Exception as exc:  # noqa: BLE001 — cache read must never break the endpoint
-                logger.debug("bank_stats_cache read failed for %s.%s (%s); computing uncached", schema, bank_id, exc)
-                return await loader()
+        #    jsonb->object codec so we always decode the same way. A forced refresh
+        #    ignores the row and recomputes. ``started`` is when this load began, in
+        #    the database's clock, for the write-back guard below.
+        try:
+            async with acquire_with_retry(self._backend) as conn:
+                row = await conn.fetchrow(
+                    f"SELECT now() AS started, (SELECT payload::text FROM {table} "
+                    f"WHERE bank_id = $1 AND computed_at > now() - make_interval(secs => $2::double precision)) AS payload",
+                    bank_id,
+                    self._ttl,
+                )
+        except Exception as exc:  # noqa: BLE001 — cache read must never break the endpoint
+            logger.debug("bank_stats_cache read failed for %s.%s (%s); computing uncached", schema, bank_id, exc)
+            return await loader()
+        if row["payload"] is not None and not force_refresh:
+            return json.loads(row["payload"])
 
         # 2. Miss — compute, then write the row back (best-effort).
         value = await loader()
         try:
             async with acquire_with_retry(self._backend) as conn:
+                # Only for the bank the load read. A load can outlive its bank: deleted (and maybe
+                # recreated under the same id) by another process meanwhile, whose invalidate has
+                # already run. Writing then would serve the deleted bank's numbers as the new one's.
                 await conn.execute(
-                    f"INSERT INTO {table} (bank_id, payload, computed_at) VALUES ($1, $2::jsonb, now()) "
+                    f"INSERT INTO {table} (bank_id, payload, computed_at) "
+                    f"SELECT $1, $2::jsonb, now() WHERE EXISTS "
+                    f"(SELECT 1 FROM {self._banks(schema)} WHERE bank_id = $1 AND created_at <= $3) "
                     f"ON CONFLICT (bank_id) DO UPDATE SET payload = EXCLUDED.payload, computed_at = now()",
                     bank_id,
                     json.dumps(value),
+                    row["started"],
                 )
         except Exception as exc:  # noqa: BLE001 — a failed write just means no caching this round
             logger.warning("bank_stats_cache write failed for %s.%s (%s)", schema, bank_id, exc)

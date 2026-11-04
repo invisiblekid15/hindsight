@@ -823,6 +823,7 @@ ENV_BANK_ALIAS_CACHE_TTL_SECONDS = "HINDSIGHT_API_BANK_ALIAS_CACHE_TTL_SECONDS"
 ENV_BANK_ALIAS_CACHE_MAX_ENTRIES = "HINDSIGHT_API_BANK_ALIAS_CACHE_MAX_ENTRIES"
 ENV_BANK_STATS_CACHE_TTL_SECONDS = "HINDSIGHT_API_BANK_STATS_CACHE_TTL_SECONDS"
 ENV_BANK_STATS_CACHE_MAX_ENTRIES = "HINDSIGHT_API_BANK_STATS_CACHE_MAX_ENTRIES"
+ENV_BANK_CACHE_SYNC_INTERVAL_SECONDS = "HINDSIGHT_API_BANK_CACHE_SYNC_INTERVAL_SECONDS"
 # Request headers copied into RequestContext.extra_headers for extensions to read.
 # Comma-separated, matched case-insensitively. Empty by default: extensions only
 # ever see headers an operator has explicitly opted in, so a custom
@@ -1842,6 +1843,10 @@ DEFAULT_BANK_ALIAS_CACHE_TTL_SECONDS = 10.0
 DEFAULT_BANK_ALIAS_CACHE_MAX_ENTRIES = 2048  # LRU bound across (schema, alias) keys
 DEFAULT_BANK_STATS_CACHE_TTL_SECONDS = 60.0  # TTL for get_bank_stats result cache; 0 disables
 DEFAULT_BANK_STATS_CACHE_MAX_ENTRIES = 1024  # LRU bound across (schema, bank) keys
+# How often each process reads the bank change log and drops the per-process bank info and alias
+# entries other processes changed or deleted (engine/bank_cache_sync.py). Bounds cross-pod staleness
+# to about this long instead of the cache TTLs. 0 disables; the TTLs then remain the only bound.
+DEFAULT_BANK_CACHE_SYNC_INTERVAL_SECONDS = 1.0
 
 # Retain settings
 DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 64000  # Max tokens for fact extraction LLM call
@@ -3716,6 +3721,7 @@ class HindsightConfig:
     bank_alias_cache_max_entries: int
     bank_stats_cache_ttl_seconds: float
     bank_stats_cache_max_entries: int
+    bank_cache_sync_interval_seconds: float
 
     # Retain settings
     retain_max_completion_tokens: int
@@ -5386,6 +5392,9 @@ class HindsightConfig:
             ),
             bank_stats_cache_max_entries=int(
                 os.getenv(ENV_BANK_STATS_CACHE_MAX_ENTRIES, str(DEFAULT_BANK_STATS_CACHE_MAX_ENTRIES))
+            ),
+            bank_cache_sync_interval_seconds=float(
+                os.getenv(ENV_BANK_CACHE_SYNC_INTERVAL_SECONDS, str(DEFAULT_BANK_CACHE_SYNC_INTERVAL_SECONDS))
             ),
             # Optimization flags
             skip_llm_verification=os.getenv(ENV_SKIP_LLM_VERIFICATION, "false").lower() == "true",

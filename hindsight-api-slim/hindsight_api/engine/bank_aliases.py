@@ -80,8 +80,9 @@ async def resolve(pool, bank_id: str) -> str:
     Cached per process, misses included: nearly every request names a real bank,
     and without a negative entry each one would pay a pooled read that can only
     ever answer "not an alias". A deleted alias therefore keeps routing, and a new
-    one stays invisible, for up to ``bank_alias_cache_ttl_seconds`` on pods other
-    than the one that made the change.
+    one stays invisible, on pods other than the one that made the change until they
+    read the bank change log (``bank_cache_sync``), or for up to
+    ``bank_alias_cache_ttl_seconds`` when that sync is off.
     """
     from .retain import bank_utils
 
@@ -128,12 +129,23 @@ async def resolve_many(pool, bank_ids: list[str]) -> list[str]:
 
 
 async def invalidate(alias: str) -> None:
-    """Drop a cached alias entry. Called by every path that writes one.
+    """Drop a cached alias entry, here and (within ``bank_cache_sync_interval_seconds``) in every
+    other process. Called by every path that writes one."""
+    from . import bank_cache_sync
 
-    In-process only, like the caches it sits beside: other pods wait out the TTL.
-    """
-    schema, key = _key(alias)
-    await _get_cache().invalidate(schema, key)
+    schema, _ = _key(alias)
+    await forget(schema, alias)
+    await bank_cache_sync.publish(schema, alias)
+
+
+async def forget(schema: str, alias: str) -> None:
+    """Drop a cached alias entry in this process only."""
+    await _get_cache().invalidate(schema, f"alias:{alias}")
+
+
+async def forget_all() -> None:
+    """Drop every cached alias entry in this process."""
+    await _get_cache().clear()
 
 
 async def alias_exists_on_conn(conn: "DatabaseConnection", alias: str) -> bool:

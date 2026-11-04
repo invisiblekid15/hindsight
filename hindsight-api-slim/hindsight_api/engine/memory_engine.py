@@ -3410,9 +3410,11 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Background maintenance loop (retention sweeps + consolidation reconcile),
         # created in initialize() once the pool/backend is ready.
+        from .bank_cache_sync import BankCacheSync
         from .maintenance import MaintenanceLoop
 
         self._maintenance_loop: MaintenanceLoop | None = None
+        self._bank_cache_sync: BankCacheSync | None = None
 
         # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
         # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (default: 50)
@@ -6518,10 +6520,15 @@ class MemoryEngine(MemoryEngineInterface):
         # Start the background maintenance loop: cross-tenant retention sweeps
         # (audit_log, llm_requests) plus the consolidation reconcile that
         # re-schedules banks with eligible-but-unscheduled facts.
+        from .bank_cache_sync import BankCacheSync
         from .maintenance import MaintenanceLoop
 
         self._maintenance_loop = MaintenanceLoop(self)
         self._maintenance_loop.start()
+
+        # Apply other processes' bank changes to this process's bank caches (see bank_cache_sync).
+        self._bank_cache_sync = BankCacheSync(self._require_backend(), get_config().bank_cache_sync_interval_seconds)
+        self._bank_cache_sync.start()
 
         self._initialized = True
         logger.info("Memory system initialized (pool and task backend started)")
@@ -6656,6 +6663,8 @@ class MemoryEngine(MemoryEngineInterface):
         # Stop the background maintenance loop (retention sweeps + reconcile)
         if self._maintenance_loop is not None:
             await self._maintenance_loop.stop()
+        if self._bank_cache_sync is not None:
+            await self._bank_cache_sync.stop()
 
         # Unregister the LLM trace recorder span hook
         from ..tracing import unregister_span_recorder
